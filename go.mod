@@ -5,12 +5,12 @@ go 1.25.0
 godebug default=go1.25
 
 replace (
-	k8s.io/api => github.com/kplane-dev/kubernetes/staging/src/k8s.io/api v0.0.0-20260303044756-e9e2a52adaf0
-	k8s.io/apimachinery => github.com/kplane-dev/kubernetes/staging/src/k8s.io/apimachinery v0.0.0-20260303044756-e9e2a52adaf0
-	k8s.io/apiserver => github.com/kplane-dev/kubernetes/staging/src/k8s.io/apiserver v0.0.0-20260303044756-e9e2a52adaf0
-	k8s.io/client-go => github.com/kplane-dev/kubernetes/staging/src/k8s.io/client-go v0.0.0-20260303044756-e9e2a52adaf0
-	k8s.io/component-base => github.com/kplane-dev/kubernetes/staging/src/k8s.io/component-base v0.0.0-20260303044756-e9e2a52adaf0
-	k8s.io/kms => github.com/kplane-dev/kubernetes/staging/src/k8s.io/kms v0.0.0-20260303044756-e9e2a52adaf0
+	k8s.io/api => github.com/kplane-dev/kubernetes/staging/src/k8s.io/api v0.0.0-20260404055358-aac72e7d04ad
+	k8s.io/apimachinery => github.com/kplane-dev/kubernetes/staging/src/k8s.io/apimachinery v0.0.0-20260404055358-aac72e7d04ad
+	k8s.io/apiserver => github.com/kplane-dev/kubernetes/staging/src/k8s.io/apiserver v0.0.0-20260404055358-aac72e7d04ad
+	k8s.io/client-go => github.com/kplane-dev/kubernetes/staging/src/k8s.io/client-go v0.0.0-20260404055358-aac72e7d04ad
+	k8s.io/component-base => github.com/kplane-dev/kubernetes/staging/src/k8s.io/component-base v0.0.0-20260404055358-aac72e7d04ad
+	k8s.io/kms => github.com/kplane-dev/kubernetes/staging/src/k8s.io/kms v0.0.0-20260404055358-aac72e7d04ad
 )
 
 require (
