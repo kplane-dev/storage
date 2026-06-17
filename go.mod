@@ -14,8 +14,7 @@ replace (
 )
 
 require (
-	cloud.google.com/go/spanner v1.92.0
-	github.com/kplane-dev/spanner v0.0.0-20260311053803-bee01b5e2306
+	cloud.google.com/go/spanner v1.88.0
 	github.com/spf13/pflag v1.0.9
 	google.golang.org/api v0.285.0
 	google.golang.org/grpc v1.81.1
