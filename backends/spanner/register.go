@@ -1,7 +1,9 @@
 package spanner
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/pflag"
 
@@ -77,11 +79,21 @@ func (o *Options) Validate() []error {
 // after Validate; the resulting Factory is invoked once per GroupResource
 // at REST registry construction time.
 //
-// We reuse the existing NewBackendFactory so the legacy hardcoded path
-// (apiserver's `if opts.SpannerProject != ""` branch) and the registry
-// path produce identical store/broadcaster/watcher behavior. That keeps
-// the Phase 3 cutover in the apiserver behavior-preserving.
+// Build also applies the kv schema to the configured Spanner database via
+// EnsureSchema. EnsureSchema is idempotent — a pre-existing database is
+// a no-op — so this is safe on every startup and avoids a separate
+// out-of-band schema apply step in the operator workflow.
 func (o *Options) Build() (registry.Factory, error) {
+	// EnsureSchema dials the database admin API, attempts CreateDatabase
+	// with the kv DDL, and treats AlreadyExists as success. A modest
+	// timeout keeps a misconfigured emulator endpoint from hanging the
+	// apiserver startup indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := EnsureSchema(ctx, o.cfg); err != nil {
+		return nil, fmt.Errorf("ensuring spanner schema: %w", err)
+	}
+
 	bf := NewBackendFactory(o.cfg)
 	return registry.Factory(bf), nil
 }

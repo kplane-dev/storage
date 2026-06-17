@@ -12,7 +12,9 @@ import (
 	instancepb "cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"k8s.io/klog/v2"
 )
@@ -104,8 +106,11 @@ func EnsureInstance(ctx context.Context, cfg SpannerConfig) error {
 	return nil
 }
 
-// EnsureSchema creates the database and applies the KV schema if it doesn't exist.
-// Intended for development / testing with the Spanner emulator.
+// EnsureSchema creates the database and applies the KV schema if it doesn't
+// exist. Idempotent: a pre-existing database returns nil instead of an
+// error, so the function is safe to call on every apiserver startup. This
+// is the seam Options.Build() uses so a fresh Spanner backend doesn't
+// require a separate schema-apply step out of band.
 func EnsureSchema(ctx context.Context, cfg SpannerConfig) error {
 	var opts []option.ClientOption
 	if cfg.EmulatorHost != "" {
@@ -122,22 +127,44 @@ func EnsureSchema(ctx context.Context, cfg SpannerConfig) error {
 	}
 	defer adminClient.Close()
 
-	// Create the database with schema in one shot.
+	// Try to create the database with schema in one shot.
 	op, err := adminClient.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          cfg.InstancePath(),
 		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", cfg.Database),
 		ExtraStatements: schemaDDL,
 	})
 	if err != nil {
+		if isAlreadyExists(err) {
+			klog.V(2).InfoS("Spanner database already exists, skipping schema apply", "database", cfg.DatabasePath())
+			return nil
+		}
 		return fmt.Errorf("creating database: %w", err)
 	}
 
 	if _, err := op.Wait(ctx); err != nil {
+		if isAlreadyExists(err) {
+			klog.V(2).InfoS("Spanner database raced to exist, skipping schema apply", "database", cfg.DatabasePath())
+			return nil
+		}
 		return fmt.Errorf("waiting for database creation: %w", err)
 	}
 
 	klog.V(2).InfoS("Spanner database created with schema", "database", cfg.DatabasePath())
 	return nil
+}
+
+// isAlreadyExists returns true if err carries a gRPC AlreadyExists status —
+// the signal the Spanner database admin API uses when CreateDatabase is
+// called against a database that already exists. Extracted so EnsureSchema
+// can treat re-runs as a no-op without parsing string messages.
+func isAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	if s, ok := status.FromError(err); ok && s.Code() == codes.AlreadyExists {
+		return true
+	}
+	return false
 }
 
 // DropDatabase drops the specified Spanner database.
