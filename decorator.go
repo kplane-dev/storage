@@ -13,21 +13,18 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"k8s.io/klog/v2"
+
+	"github.com/kplane-dev/storage/registry"
 )
 
 // BackendFactory constructs the underlying raw storage for one resource.
-// Signature matches upstream k8s.io/apiserver/pkg/storage/storagebackend/
-// factory.Create — so any backend that already satisfies that shape (etcd3,
-// Spanner, future postgres) plugs in without adaptation.
-//
-// Mirrors registry.Factory; declared here as a top-level type so consumers
-// of DecoratorConfig don't need a transitive import of the registry
-// subpackage.
-type BackendFactory func(
-	config *storagebackend.ConfigForResource,
-	newFunc, newListFunc func() runtime.Object,
-	resourcePrefix string,
-) (storage.Interface, factory.DestroyFunc, error)
+// Aliased to registry.Factory so the apiserver can pass the same value
+// returned by registry.Backend.Build() directly into DecoratorConfig
+// without a type conversion. Signature matches upstream
+// k8s.io/apiserver/pkg/storage/storagebackend/factory.Create — so any
+// backend that already satisfies that shape (etcd3, Spanner, future
+// postgres) plugs in without adaptation.
+type BackendFactory = registry.Factory
 
 // DecoratorConfig configures the cluster-aware StorageDecorator.
 type DecoratorConfig struct {
