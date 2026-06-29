@@ -6,6 +6,10 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/storage"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
+	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 
 	"github.com/kplane-dev/storage/registry"
 )
@@ -32,6 +36,11 @@ import (
 // behavior drift.
 type Options struct {
 	cfg SpannerConfig
+
+	// fb is the lazily-constructed factory.Backend shared between Build()
+	// (CR storage via the decorator) and BuildFactoryBackend() (internal
+	// state via factory.Register). Single client per Options.
+	fb *FactoryBackend
 }
 
 // NewOptions returns a fresh Options. The apiserver registers this via
@@ -83,7 +92,37 @@ func (o *Options) Validate() []error {
 // EnsureSchema. EnsureSchema is idempotent — a pre-existing database is
 // a no-op — so this is safe on every startup and avoids a separate
 // out-of-band schema apply step in the operator workflow.
+//
+// Build and BuildFactoryBackend share a single FactoryBackend instance
+// (and therefore a single Spanner client) per Options. Whichever method is
+// called first dials and applies schema; the second is free. This matters
+// because the apiserver calls both (CR storage goes through Build → the
+// decorator's BackendFactory; internal stores go through BuildFactoryBackend
+// → factory.Register), and we don't want two clients per process.
 func (o *Options) Build() (registry.Factory, error) {
+	fb, err := o.factoryBackend()
+	if err != nil {
+		return nil, err
+	}
+	return registry.Factory(func(
+		config *storagebackend.ConfigForResource,
+		newFunc, newListFunc func() runtime.Object,
+		resourcePrefix string,
+	) (storage.Interface, factory.DestroyFunc, error) {
+		return fb.Create(*config, newFunc, newListFunc, resourcePrefix)
+	}), nil
+}
+
+// BuildFactoryBackend returns the fork-level factory.Backend implementation
+// for this Options. Idempotent: subsequent calls reuse the cached backend.
+func (o *Options) BuildFactoryBackend() (factory.Backend, error) {
+	return o.factoryBackend()
+}
+
+func (o *Options) factoryBackend() (*FactoryBackend, error) {
+	if o.fb != nil {
+		return o.fb, nil
+	}
 	// EnsureSchema dials the database admin API, attempts CreateDatabase
 	// with the kv DDL, and treats AlreadyExists as success. A modest
 	// timeout keeps a misconfigured emulator endpoint from hanging the
@@ -93,9 +132,12 @@ func (o *Options) Build() (registry.Factory, error) {
 	if err := EnsureSchema(ctx, o.cfg); err != nil {
 		return nil, fmt.Errorf("ensuring spanner schema: %w", err)
 	}
-
-	bf := NewBackendFactory(o.cfg)
-	return registry.Factory(bf), nil
+	fb, err := NewFactoryBackend(ctx, o.cfg)
+	if err != nil {
+		return nil, err
+	}
+	o.fb = fb
+	return fb, nil
 }
 
 // Compile-time assertion: Options satisfies registry.Backend.

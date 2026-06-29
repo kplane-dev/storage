@@ -38,6 +38,7 @@ func (f *fakeBackend) Build() (registry.Factory, error) {
 		return nil, func() {}, nil
 	}, nil
 }
+func (f *fakeBackend) BuildFactoryBackend() (factory.Backend, error) { return nil, nil }
 
 func TestRegisterAndGet(t *testing.T) {
 	b := registry.New()

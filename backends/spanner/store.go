@@ -90,6 +90,33 @@ func (s *store) Versioner() storage.Versioner {
 	return s.versioner
 }
 
+// newObject returns a fresh instance of the type the store decodes into.
+// Prefers s.newFunc (set by callers that supply a generator: CR storage via
+// RESTOptionsGetter), and falls back to reflecting on hint's type for
+// callers that pass nil — service IP / NodePort allocators and master/peer
+// endpoint leases call factory.Create with nil newFunc and rely on the
+// destination argument as the type prototype, the same way upstream's
+// etcd3 store does.
+func (s *store) newObject(hint runtime.Object) runtime.Object {
+	if s.newFunc != nil {
+		return s.newFunc()
+	}
+	if u, ok := hint.(runtime.Unstructured); ok {
+		return u.NewEmptyInstance()
+	}
+	return reflect.New(reflect.TypeOf(hint).Elem()).Interface().(runtime.Object)
+}
+
+// newObjectOfType is the List-side analog: GetList walks a slice and needs
+// fresh instances of the element type, not the list type. The element type
+// is derivable from the listObj via reflect.
+func (s *store) newObjectOfType(t reflect.Type) runtime.Object {
+	if s.newFunc != nil {
+		return s.newFunc()
+	}
+	return reflect.New(t).Interface().(runtime.Object)
+}
+
 // prepareKey validates and normalizes the storage key.
 // Rejects path traversal attacks (.. and .), empty keys, and keys that
 // don't start with the expected path prefix.
@@ -112,7 +139,14 @@ func (s *store) prepareKey(key string) (string, error) {
 	if strings.HasPrefix(key, s.pathPrefix) {
 		return key, nil
 	}
-	return s.pathPrefix + key, nil
+	// Trim a leading "/" off key before joining: pathPrefix always has a
+	// trailing "/", and incoming keys from the multicluster decorator's
+	// rewriteKey already start with "/" (upstream resourcePrefix carries
+	// its own leading slash). Without the trim we'd produce
+	// "/registry//apiregistration.k8s.io/..." — functionally harmless
+	// because reads and writes both go through prepareKey, but ugly and
+	// fragile for any future prefix range query.
+	return s.pathPrefix + strings.TrimPrefix(key, "/"), nil
 }
 
 func (s *store) storageKeyFromSpannerKey(spannerKey string) string {
@@ -266,7 +300,7 @@ func (s *store) Delete(
 			if err != nil {
 				return storage.NewInternalError(err)
 			}
-			existing = s.newFunc()
+			existing = s.newObject(out)
 			if err := decode(s.codec, s.versioner, data, existing, revisionFromCommitTimestamp(modTs)); err != nil {
 				return err
 			}
@@ -407,7 +441,7 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 		if err != nil {
 			return storage.NewInternalError(err)
 		}
-		obj := s.newFunc()
+		obj := s.newObjectOfType(v.Type().Elem())
 		if err := decode(s.codec, s.versioner, data, obj, revisionFromCommitTimestamp(modTs)); err != nil {
 			return err
 		}
@@ -467,7 +501,7 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 			return storage.NewInternalError(err)
 		}
 
-		obj := s.newFunc()
+		obj := s.newObjectOfType(v.Type().Elem())
 		if err := decode(s.codec, s.versioner, data, obj, rv); err != nil {
 			klog.Errorf("failed to decode object at key %s: %v", rowKey, err)
 			continue
@@ -566,7 +600,7 @@ func (s *store) GuaranteedUpdate(
 				if !ignoreNotFound {
 					return storage.NewKeyNotFoundError(preparedKey, 0)
 				}
-				origObj = s.newFunc()
+				origObj = s.newObject(destination)
 			} else {
 				var val []byte
 				var modTs time.Time
@@ -589,7 +623,7 @@ func (s *store) GuaranteedUpdate(
 					if err != nil {
 						return storage.NewInternalError(err)
 					}
-					origObj = s.newFunc()
+					origObj = s.newObject(destination)
 					if err := decode(s.codec, s.versioner, data, origObj, revisionFromCommitTimestamp(modTs)); err != nil {
 						return err
 					}
@@ -705,7 +739,7 @@ func (s *store) GuaranteedUpdate(
 func (s *store) Stats(ctx context.Context) (storage.Stats, error) {
 	stmt := spanner.Statement{
 		SQL:    "SELECT COUNT(*) as cnt FROM kv WHERE STARTS_WITH(key, @prefix)",
-		Params: map[string]interface{}{"prefix": s.pathPrefix + s.resourcePrefix},
+		Params: map[string]interface{}{"prefix": s.pathPrefix + strings.TrimPrefix(s.resourcePrefix, "/")},
 	}
 	iter := s.client.Single().Query(ctx, stmt)
 	defer iter.Stop()

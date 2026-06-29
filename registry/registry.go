@@ -72,6 +72,17 @@ type Backend interface {
 	// Any expensive setup (dialing a remote, opening a session pool)
 	// belongs here, not in AddFlags or Validate.
 	Build() (Factory, error)
+
+	// BuildFactoryBackend returns the fork-level factory.Backend that the
+	// apiserver registers via factory.Register(name, b) so non-CR storage
+	// callsites (master/peer endpoint leases, service IP/NodePort
+	// allocators) dispatch to this backend the same way CR storage does.
+	//
+	// Implementations should reuse the same underlying client/state as
+	// Build() to avoid double-dialing — typical pattern is to build state
+	// once internally and have both Build and BuildFactoryBackend hand out
+	// thin views over it.
+	BuildFactoryBackend() (factory.Backend, error)
 }
 
 // Backends is the instance-scoped registry. It mirrors upstream's
