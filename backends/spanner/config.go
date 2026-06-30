@@ -60,6 +60,19 @@ func (c SpannerConfig) NewClient(ctx context.Context) (*spanner.Client, error) {
 }
 
 // schemaDDL returns the DDL statements for the kv table and change stream.
+//
+// expire_at is the "row expires at" wall-clock timestamp, populated only for
+// rows created with a non-zero TTL. It drives three independent layers of
+// TTL handling:
+//   - read filter: Get/GetList exclude rows where expire_at ≤ CURRENT_TIMESTAMP()
+//   - watch emission: a per-broadcaster scanner publishes synthetic Delete
+//     events for newly-expired rows
+//   - physical cleanup: Spanner's ROW DELETION POLICY removes expired rows
+//     from storage in the background (best-effort; correctness is enforced
+//     by the read filter and watch emission)
+//
+// kv_by_expire_at indexes the TTL scanner's hot query
+// (`WHERE expire_at BETWEEN @watermark AND CURRENT_TIMESTAMP()`).
 var schemaDDL = []string{
 	`CREATE TABLE kv (
     key        STRING(MAX) NOT NULL,
@@ -67,7 +80,10 @@ var schemaDDL = []string{
     mod_ts     TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
     create_ts  TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
     lease_ttl  INT64,
-) PRIMARY KEY (key)`,
+    expire_at  TIMESTAMP,
+) PRIMARY KEY (key),
+  ROW DELETION POLICY (OLDER_THAN(expire_at, INTERVAL 0 DAY))`,
+	`CREATE INDEX kv_by_expire_at ON kv (expire_at) STORING (value)`,
 	`CREATE CHANGE STREAM kv_changes FOR kv
   OPTIONS (value_capture_type = 'OLD_AND_NEW_VALUES')`,
 }

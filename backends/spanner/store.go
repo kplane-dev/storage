@@ -71,7 +71,7 @@ func NewStore(
 		pathPrefix += "/"
 	}
 
-	return &store{
+	s := &store{
 		client:            client,
 		codec:             codec,
 		versioner:         storage.APIObjectVersioner{},
@@ -84,6 +84,12 @@ func NewStore(
 		broadcaster:       NewBroadcaster(),
 		wrapDecodedObject: wrapDecodedObject,
 	}
+	// Start the TTL eviction scanner. 1s cadence matches etcd's
+	// lease-expiration detection latency; the scanner only does work
+	// when rows actually expire in the window so steady-state cost is
+	// one tiny indexed SELECT/second.
+	s.broadcaster.StartTTLScanner(s, time.Second)
+	return s
 }
 
 func (s *store) Versioner() storage.Versioner {
@@ -149,8 +155,22 @@ func (s *store) prepareKey(key string) (string, error) {
 	return s.pathPrefix + strings.TrimPrefix(key, "/"), nil
 }
 
+// storageKeyFromSpannerKey strips the apiserver's etcd-prefix (`s.pathPrefix`,
+// typically `/registry/`) from a stored key, restoring the storage-relative
+// path that callers (cacher's keyFunc, watch event consumers, decode
+// callback) expect. The leading slash MUST be preserved: etcd stores keys
+// as e.g. `/registry/apiregistration.k8s.io/...` and exposes them to the
+// cacher as `/apiregistration.k8s.io/...` — the cacher's watchCache then
+// looks them up by prefix `/apiregistration.k8s.io/clusters/`. Without the
+// leading slash here, the cluster-aware cacher's `ListPrefix` misses every
+// item it stored, and LIST returns empty even though watch events were
+// successfully delivered and indexed.
 func (s *store) storageKeyFromSpannerKey(spannerKey string) string {
-	return strings.TrimPrefix(spannerKey, s.pathPrefix)
+	stripped := strings.TrimPrefix(spannerKey, s.pathPrefix)
+	if !strings.HasPrefix(stripped, "/") {
+		stripped = "/" + stripped
+	}
+	return stripped
 }
 
 // Create adds a new object at the given key.
@@ -185,7 +205,20 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 	}
 	if ttl != 0 {
 		cols["lease_ttl"] = int64(ttl)
+		// expire_at drives TTL eviction (read filter + scanner emit +
+		// Spanner's ROW DELETION POLICY). Computed client-side because
+		// spanner.CommitTimestamp is a server-side sentinel — we can't
+		// arithmetic on it from the client. The few-ms skew between
+		// client_now and commit_ts is well below TTL granularity.
+		cols["expire_at"] = time.Now().Add(time.Duration(ttl) * time.Second)
 	}
+	// AcquireWrite must bracket Apply so the broadcaster's dispatcher
+	// knows not to flush newer events ahead of this one. The defer Cancel
+	// covers every error path; the success path calls Publish which
+	// resolves the ticket (Cancel becomes a no-op).
+	ticket := s.broadcaster.AcquireWrite()
+	defer ticket.Cancel()
+
 	// Use Apply with Insert (not InsertOrUpdate) so Spanner rejects
 	// duplicates via PRIMARY KEY constraint — avoids a ReadRow round trip.
 	commitTs, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.InsertMap("kv", cols)})
@@ -202,8 +235,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 		}
 	}
 
-	// Publish watch event.
-	s.broadcaster.Publish(watchEvent{
+	ticket.Publish(watchEvent{
 		key:       preparedKey,
 		value:     newData,
 		rev:       int64(revisionFromCommitTimestamp(commitTs)),
@@ -224,19 +256,36 @@ func (s *store) Get(ctx context.Context, key string, opts storage.GetOptions, ou
 	txn := s.client.Single()
 	if opts.ResourceVersion != "" {
 		if parsed, err := s.versioner.ParseResourceVersion(opts.ResourceVersion); err == nil && parsed > 0 {
+			// Guard against future-dated RVs: Spanner refuses reads bounded
+			// at a timestamp more than ~1h in the future with
+			// DeadlineExceeded. The apiserver contract is to return a
+			// typed TooLargeResourceVersionError instead so the caller can
+			// retry with backoff.
+			if cur, curErr := s.GetCurrentResourceVersion(ctx); curErr == nil && parsed > cur {
+				return storage.NewTooLargeResourceVersionError(parsed, cur, 1)
+			}
 			txn = s.client.Single().WithTimestampBound(spanner.ReadTimestamp(timestampFromRevision(int64(parsed))))
 		}
 	}
 	defer txn.Close()
 
-	row, err := txn.ReadRow(ctx, "kv", spanner.Key{preparedKey}, []string{"value", "mod_ts"})
-	if err != nil {
-		if spanner.ErrCode(err) == 5 { // NOT_FOUND
-			if opts.IgnoreNotFound {
-				return runtime.SetZeroValue(out)
-			}
-			return storage.NewKeyNotFoundError(preparedKey, 0)
+	// SQL (not ReadRow) so we can apply the TTL read filter atomically.
+	// Rows past expire_at are invisible to Get even if Spanner's row
+	// deletion policy hasn't yet physically removed them.
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL: `SELECT value, mod_ts FROM kv WHERE key = @key
+              AND (expire_at IS NULL OR expire_at > CURRENT_TIMESTAMP())`,
+		Params: map[string]interface{}{"key": preparedKey},
+	})
+	defer iter.Stop()
+	row, err := iter.Next()
+	if err == iterator.Done {
+		if opts.IgnoreNotFound {
+			return runtime.SetZeroValue(out)
 		}
+		return storage.NewKeyNotFoundError(preparedKey, 0)
+	}
+	if err != nil {
 		return err
 	}
 
@@ -271,6 +320,9 @@ func (s *store) Delete(
 
 	var oldData []byte    // decrypted, for decoding into out
 	var oldEncData []byte // encrypted, for watch event prevValue
+
+	ticket := s.broadcaster.AcquireWrite()
+	defer ticket.Cancel()
 
 	commitTs, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, "kv", spanner.Key{preparedKey}, []string{"value", "mod_ts"})
@@ -338,7 +390,7 @@ func (s *store) Delete(
 		return err
 	}
 
-	s.broadcaster.Publish(watchEvent{
+	ticket.Publish(watchEvent{
 		key:       preparedKey,
 		prevValue: oldEncData,
 		rev:       int64(rv),
@@ -367,7 +419,7 @@ func (s *store) Watch(ctx context.Context, key string, opts storage.ListOptions)
 		rev = int64(parsed)
 	}
 
-	w := newWatcher(s, preparedKey, opts, rev)
+	w := newWatcher(s, ctx, preparedKey, opts, rev)
 	return w, nil
 }
 
@@ -395,6 +447,19 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 		return err
 	}
 
+	// Guard against future-dated RVs (Spanner refuses with DeadlineExceeded;
+	// the apiserver expects TooLargeResourceVersionError). We check the
+	// raw opts.ResourceVersion — ValidateListOptions returns withRev==0
+	// for legacy ResourceVersionMatch="" + non-recursive queries, even
+	// when the caller specified a too-high RV.
+	if opts.ResourceVersion != "" && opts.ResourceVersion != "0" {
+		if parsedRV, perr := s.versioner.ParseResourceVersion(opts.ResourceVersion); perr == nil && parsedRV > 0 {
+			if cur, curErr := s.GetCurrentResourceVersion(ctx); curErr == nil && parsedRV > cur {
+				return storage.NewTooLargeResourceVersionError(parsedRV, cur, 1)
+			}
+		}
+	}
+
 	// Build the read transaction (strong or stale).
 	var txn *spanner.ReadOnlyTransaction
 	if withRev > 0 {
@@ -420,15 +485,26 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 			Kind:  spanner.ClosedOpen,
 		}
 	} else {
-		// Non-recursive: exact key match.
-		row, err := txn.ReadRow(ctx, "kv", spanner.Key{preparedKey}, []string{"key", "value", "mod_ts"})
-		if err != nil {
-			if spanner.ErrCode(err) == 5 { // NOT_FOUND
-				if v.IsNil() {
-					v.Set(reflect.MakeSlice(v.Type(), 0, 0))
-				}
-				return s.versioner.UpdateList(listObj, uint64(withRev), "", nil)
+		// Non-recursive: exact key match. SQL (not ReadRow) so we can
+		// apply the TTL read filter atomically.
+		iter := txn.Query(ctx, spanner.Statement{
+			SQL: `SELECT key, value, mod_ts FROM kv WHERE key = @key
+                  AND (expire_at IS NULL OR expire_at > CURRENT_TIMESTAMP())`,
+			Params: map[string]interface{}{"key": preparedKey},
+		})
+		defer iter.Stop()
+		row, err := iter.Next()
+		if err == iterator.Done {
+			if v.IsNil() {
+				v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 			}
+			rv, err := s.resolveListRV(ctx, txn, withRev)
+			if err != nil {
+				return err
+			}
+			return s.versioner.UpdateList(listObj, rv, "", nil)
+		}
+		if err != nil {
 			return err
 		}
 		var rowKey string
@@ -454,18 +530,35 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 		if matched, err := opts.Predicate.Matches(obj); err == nil && matched {
 			v.Set(reflect.Append(v, reflect.ValueOf(obj).Elem()))
 		}
-		// Use transaction read timestamp for consistency with recursive path.
-		readRV := revisionFromCommitTimestamp(modTs)
-		if ts, tsErr := txn.Timestamp(); tsErr == nil {
-			readRV = revisionFromCommitTimestamp(ts)
+		// Ensure the slice is non-nil even when the predicate didn't match
+		// — upstream conformance compares `[]T{}` (empty slice) against
+		// our return and rejects nil-underlying slices.
+		if v.IsNil() {
+			v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 		}
-		return s.versioner.UpdateList(listObj, readRV, "", nil)
+		rv, err := s.resolveListRV(ctx, txn, withRev)
+		if err != nil {
+			return err
+		}
+		return s.versioner.UpdateList(listObj, rv, "", nil)
 	}
 
 	limit := opts.Predicate.Limit
 	paging := limit > 0
 
-	iter := txn.Read(ctx, "kv", spanner.KeySets(keyRange), []string{"key", "value", "mod_ts"})
+	// SQL with the TTL read filter — rows past expire_at are invisible to
+	// LIST even if Spanner's row deletion policy hasn't physically removed
+	// them yet. Equivalent to the Read above but with the WHERE predicate.
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL: `SELECT key, value, mod_ts FROM kv
+              WHERE key >= @start AND key < @end
+                AND (expire_at IS NULL OR expire_at > CURRENT_TIMESTAMP())
+              ORDER BY key`,
+		Params: map[string]interface{}{
+			"start": keyRange.Start[0],
+			"end":   keyRange.End[0],
+		},
+	})
 	defer iter.Stop()
 
 	var lastKey string
@@ -512,7 +605,7 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 			cb(obj, s.storageKeyFromSpannerKey(rowKey), int64(rv))
 		}
 
-		if matched, matchErr := opts.Predicate.Matches(obj); matchErr == nil && matched {
+		if matched, err := opts.Predicate.Matches(obj); err == nil && matched {
 			v.Set(reflect.Append(v, reflect.ValueOf(obj).Elem()))
 		}
 
@@ -531,21 +624,9 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 	// Use the transaction's read timestamp as the list RV. This ensures
 	// paginated continuations read at the same snapshot, even if some items
 	// have later mod_ts than the ones returned on this page.
-	var listRV uint64
-	if withRev > 0 {
-		listRV = uint64(withRev)
-	} else {
-		readTs, err := txn.Timestamp()
-		if err == nil {
-			listRV = revisionFromCommitTimestamp(readTs)
-		}
-		// Fallback: if no rows were read, txn.Timestamp() may fail.
-		// Use current timestamp to ensure a non-zero RV.
-		if listRV == 0 {
-			if ts, tsErr := s.getCurrentTimestamp(ctx); tsErr == nil {
-				listRV = revisionFromCommitTimestamp(ts)
-			}
-		}
+	listRV, err := s.resolveListRV(ctx, txn, withRev)
+	if err != nil {
+		return err
 	}
 
 	var continueValue string
@@ -585,6 +666,12 @@ func (s *store) GuaranteedUpdate(
 		var noopRev int64      // set when data is unchanged (no-op), holds existing mod_ts
 		var created bool       // true when object didn't exist (upsert)
 		var conflict bool      // set when tryUpdate returns a retriable conflict
+
+		// Per-attempt ticket: retries acquire a fresh one. defer-style
+		// cleanup wrapped inside the iteration via an immediately-invoked
+		// func so each loop iteration's ticket is released on return,
+		// whether it Publishes or Cancels.
+		ticket := s.broadcaster.AcquireWrite()
 
 		commitTs, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			row, readErr := txn.ReadRow(ctx, "kv", spanner.Key{preparedKey}, []string{"value", "mod_ts"})
@@ -684,6 +771,12 @@ func (s *store) GuaranteedUpdate(
 			}
 			if ttl != nil && *ttl != 0 {
 				cols["lease_ttl"] = int64(*ttl)
+				cols["expire_at"] = time.Now().Add(time.Duration(*ttl) * time.Second)
+			} else if ttl != nil {
+				// ttl explicitly cleared — null out expire_at so the row
+				// stops being a TTL candidate.
+				cols["lease_ttl"] = nil
+				cols["expire_at"] = nil
 			}
 
 			var m *spanner.Mutation
@@ -700,6 +793,7 @@ func (s *store) GuaranteedUpdate(
 			return nil
 		})
 		if err != nil {
+			ticket.Cancel()
 			if conflict {
 				// Retry: re-read current state and call tryUpdate again.
 				conflict = false
@@ -717,18 +811,22 @@ func (s *store) GuaranteedUpdate(
 		}
 
 		if err := decode(s.codec, s.versioner, newData, destination, rv); err != nil {
+			ticket.Cancel()
 			return err
 		}
 
-		// Only publish watch event if data actually changed.
+		// Only publish watch event if data actually changed. No-op writes
+		// release the ticket without enqueuing an event.
 		if noopRev == 0 {
-			s.broadcaster.Publish(watchEvent{
+			ticket.Publish(watchEvent{
 				key:       preparedKey,
 				value:     newEncData,
 				prevValue: origEncData,
 				rev:       int64(rv),
 				isCreated: created,
 			})
+		} else {
+			ticket.Cancel()
 		}
 
 		return nil
@@ -771,7 +869,7 @@ func (s *store) RequestWatchProgress(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.broadcaster.Publish(watchEvent{
+	s.broadcaster.PublishProgress(watchEvent{
 		rev:        int64(revisionFromCommitTimestamp(ts)),
 		isProgress: true,
 	})
@@ -827,6 +925,46 @@ func (s *store) getCurrentTimestamp(ctx context.Context) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return ts, nil
+}
+
+// resolveListRV picks the resource version GetList should attach to a
+// returned list. The invariant the upstream cacher relies on: every
+// non-error List response carries a RV > 0. Returning 0 trips the
+// `illegal resource version from storage: 0` check and breaks the
+// watchCache.
+//
+// Precedence:
+//  1. If the caller specified a snapshot RV (withRev > 0), echo it back
+//     — the txn was bound to it, so it's the authoritative read RV.
+//  2. Otherwise prefer the transaction's read timestamp. After any
+//     successful Query/Read on a Spanner ReadOnly txn (including one
+//     that returned zero rows), the server-picked timestamp is
+//     available; we use that so the list RV matches what the txn
+//     actually read at.
+//  3. As a last resort — only meaningful if the caller never executed
+//     a read on the txn — fall back to a fresh CURRENT_TIMESTAMP()
+//     round trip.
+//
+// Any failure to produce a usable RV is returned as an error rather
+// than silently substituting 0.
+func (s *store) resolveListRV(ctx context.Context, txn *spanner.ReadOnlyTransaction, withRev int64) (uint64, error) {
+	if withRev > 0 {
+		return uint64(withRev), nil
+	}
+	if ts, err := txn.Timestamp(); err == nil {
+		if rv := revisionFromCommitTimestamp(ts); rv > 0 {
+			return rv, nil
+		}
+	}
+	ts, err := s.getCurrentTimestamp(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("resolveListRV: txn read timestamp unavailable and CURRENT_TIMESTAMP() failed: %w", err)
+	}
+	rv := revisionFromCommitTimestamp(ts)
+	if rv == 0 {
+		return 0, fmt.Errorf("resolveListRV: CURRENT_TIMESTAMP() returned zero-valued revision")
+	}
+	return rv, nil
 }
 
 // decode decodes data into out and sets the resource version.

@@ -17,6 +17,7 @@ import (
 // spannerWatcher implements watch.Interface backed by a broadcast subscription.
 type spannerWatcher struct {
 	store    *store
+	ctx      context.Context
 	prefix   string
 	opts     storage.ListOptions
 	startRev int64
@@ -30,9 +31,10 @@ type spannerWatcher struct {
 
 var _ watch.Interface = (*spannerWatcher)(nil)
 
-func newWatcher(s *store, prefix string, opts storage.ListOptions, startRev int64) *spannerWatcher {
+func newWatcher(s *store, ctx context.Context, prefix string, opts storage.ListOptions, startRev int64) *spannerWatcher {
 	w := &spannerWatcher{
 		store:    s,
+		ctx:      ctx,
 		prefix:   prefix,
 		opts:     opts,
 		startRev: startRev,
@@ -59,11 +61,30 @@ func (w *spannerWatcher) Stop() {
 func (w *spannerWatcher) run() {
 	defer close(w.result)
 
+	// Honor an already-cancelled context: exit immediately rather than
+	// running the initial-events query and blocking on the broadcast
+	// subscription. Matches upstream etcd3 watcher behavior — Watch on a
+	// dead context returns a closed channel without dispatching events.
+	if w.ctx != nil {
+		select {
+		case <-w.ctx.Done():
+			return
+		default:
+		}
+	}
+
 	klog.V(4).Infof("spannerWatcher.run: prefix=%q startRev=%d sendInitialEvents=%v", w.prefix, w.startRev, w.opts.SendInitialEvents)
 
-	// If SendInitialEvents is requested, send a snapshot first,
-	// then a bookmark, then switch to streaming.
-	if w.opts.SendInitialEvents != nil && *w.opts.SendInitialEvents {
+	// Send initial events when:
+	//  - SendInitialEvents is explicitly true (WatchList contract), OR
+	//  - SendInitialEvents is unset AND RV==0 (etcd's legacy "watch from
+	//    zero" behavior — the upstream conformance suite asserts a client
+	//    watching at RV=0 receives the current state as ADDED events
+	//    before the live stream).
+	// Matches etcd3's areInitialEventsRequired().
+	wantInitial := (w.opts.SendInitialEvents != nil && *w.opts.SendInitialEvents) ||
+		(w.opts.SendInitialEvents == nil && w.startRev == 0)
+	if wantInitial {
 		if err := w.sendInitialEvents(); err != nil {
 			klog.Errorf("failed to send initial events: %v", err)
 			return
@@ -73,9 +94,15 @@ func (w *spannerWatcher) run() {
 	klog.V(4).Infof("spannerWatcher.run: streaming from broadcaster, prefix=%q startRev=%d", w.prefix, w.startRev)
 
 	// Stream events from the broadcaster.
+	var ctxDone <-chan struct{}
+	if w.ctx != nil {
+		ctxDone = w.ctx.Done()
+	}
 	for {
 		select {
 		case <-w.done:
+			return
+		case <-ctxDone:
 			return
 		case e, ok := <-w.sub.ch:
 			if !ok {
@@ -132,15 +159,26 @@ func (w *spannerWatcher) sendInitialEvents() error {
 
 	klog.V(4).Infof("spannerWatcher.sendInitialEvents: prefix=%q items=%d", w.prefix, len(items))
 
+	// Track the highest RV among the items we emit so the streaming loop
+	// can dedup against re-delivery from the broadcaster (events ≤ this
+	// watermark were already covered by the initial snapshot).
+	var maxItemRV int64
 	for _, item := range items {
 		obj := item
-		if w.store.wrapDecodedObject != nil && keyMap != nil {
-			if accessor, aErr := meta.Accessor(item); aErr == nil {
+		var itemRV int64
+		if accessor, aErr := meta.Accessor(item); aErr == nil {
+			if rv, parseErr := w.store.versioner.ParseResourceVersion(accessor.GetResourceVersion()); parseErr == nil {
+				itemRV = int64(rv)
+			}
+			if w.store.wrapDecodedObject != nil && keyMap != nil {
 				id := accessor.GetResourceVersion() + "|" + accessor.GetNamespace() + "|" + accessor.GetName()
 				if storageKey, ok := keyMap[id]; ok {
 					obj = w.store.wrapDecodedObject(item, storageKey)
 				}
 			}
+		}
+		if itemRV > maxItemRV {
+			maxItemRV = itemRV
 		}
 		select {
 		case <-w.done:
@@ -156,10 +194,15 @@ func (w *spannerWatcher) sendInitialEvents() error {
 	}
 	klog.V(4).Infof("spannerWatcher.sendInitialEvents: bookmarkRV=%d allowBookmarks=%v prefix=%q", bookmarkRV, w.opts.Predicate.AllowWatchBookmarks, w.prefix)
 
-	// Send a bookmark to signal the end of initial events.
-	// The annotation is required by the WatchList contract so that the
-	// reflector knows the initial snapshot is complete.
-	if w.opts.Predicate.AllowWatchBookmarks && bookmarkRV > 0 {
+	// Send a bookmark to signal the end of initial events — but ONLY when
+	// SendInitialEvents was explicitly requested (the WatchList contract).
+	// For the legacy RV=0 path (SendInitialEvents nil), etcd does NOT
+	// emit a bookmark between the replayed adds and the live stream, and
+	// the upstream conformance suite asserts the next event after the
+	// initial ADDED is the next real mutation (e.g. Modified) — not a
+	// bookmark.
+	explicitSendInitial := w.opts.SendInitialEvents != nil && *w.opts.SendInitialEvents
+	if explicitSendInitial && w.opts.Predicate.AllowWatchBookmarks && bookmarkRV > 0 {
 		bookmarkObj := w.store.newFunc()
 		_ = w.store.versioner.UpdateObject(bookmarkObj, bookmarkRV)
 		if err := storage.AnnotateInitialEventsEndBookmark(bookmarkObj); err != nil {
@@ -172,10 +215,18 @@ func (w *spannerWatcher) sendInitialEvents() error {
 		}
 	}
 
-	// Advance startRev so the broadcast stream doesn't re-emit events
-	// that were already covered by the initial list.
-	if int64(bookmarkRV) > w.startRev {
-		w.startRev = int64(bookmarkRV)
+	// Advance startRev so the broadcast stream doesn't re-emit events we
+	// already covered by the initial list. For the explicit WatchList
+	// contract use bookmarkRV (etcd contract). For the legacy RV=0 case
+	// use the highest RV among emitted items — using bookmarkRV there
+	// would race a concurrent write that committed just BEFORE
+	// GetCurrentResourceVersion returned and silently filter it out.
+	advanceTo := maxItemRV
+	if explicitSendInitial && int64(bookmarkRV) > advanceTo {
+		advanceTo = int64(bookmarkRV)
+	}
+	if advanceTo > w.startRev {
+		w.startRev = advanceTo
 	}
 
 	return nil

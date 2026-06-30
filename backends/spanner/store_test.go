@@ -587,10 +587,13 @@ func TestGuaranteedUpdateNoOp(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// Start a watcher to verify no event is emitted.
+	// Start a watcher to verify no event is emitted. Watch from the
+	// post-create RV so the legacy "RV=0 → send initial events" path
+	// doesn't replay the just-created object as ADDED before our no-op.
 	w, err := s.Watch(ctx, "/testobjs/", storage.ListOptions{
-		Predicate: storage.Everything,
-		Recursive: true,
+		ResourceVersion: created.ResourceVersion,
+		Predicate:       storage.Everything,
+		Recursive:       true,
 	})
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
@@ -1188,9 +1191,11 @@ func TestWatchDeleteHasObject(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
+	// Watch from the post-create RV — see TestWatchDelete for rationale.
 	w, err := s.Watch(ctx, "/testobjs/", storage.ListOptions{
-		Predicate: storage.Everything,
-		Recursive: true,
+		ResourceVersion: out.ResourceVersion,
+		Predicate:       storage.Everything,
+		Recursive:       true,
 	})
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
@@ -1355,9 +1360,12 @@ func TestWatchDelete(t *testing.T) {
 	}
 
 	// Start watching.
+	// Watch from the post-create RV so the legacy "RV=0 → send initial
+	// events" behavior doesn't replay the just-created object as ADDED.
 	w, err := s.Watch(ctx, "/testobjs/", storage.ListOptions{
-		Predicate: storage.Everything,
-		Recursive: true,
+		ResourceVersion: out.ResourceVersion,
+		Predicate:       storage.Everything,
+		Recursive:       true,
 	})
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
@@ -1401,10 +1409,12 @@ func TestWatchModify(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// Start watching.
+	// Start watching from the post-create RV so the legacy initial-events
+	// replay doesn't deliver the just-created object before our Update.
 	w, err := s.Watch(ctx, "/testobjs/", storage.ListOptions{
-		Predicate: storage.Everything,
-		Recursive: true,
+		ResourceVersion: out.ResourceVersion,
+		Predicate:       storage.Everything,
+		Recursive:       true,
 	})
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
