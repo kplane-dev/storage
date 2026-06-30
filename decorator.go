@@ -13,7 +13,18 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"k8s.io/klog/v2"
+
+	"github.com/kplane-dev/storage/registry"
 )
+
+// BackendFactory constructs the underlying raw storage for one resource.
+// Aliased to registry.Factory so the apiserver can pass the same value
+// returned by registry.Backend.Build() directly into DecoratorConfig
+// without a type conversion. Signature matches upstream
+// k8s.io/apiserver/pkg/storage/storagebackend/factory.Create — so any
+// backend that already satisfies that shape (etcd3, Spanner, future
+// postgres) plugs in without adaptation.
+type BackendFactory = registry.Factory
 
 // DecoratorConfig configures the cluster-aware StorageDecorator.
 type DecoratorConfig struct {
@@ -23,6 +34,15 @@ type DecoratorConfig struct {
 	// GroupResource identifies the resource type being stored.
 	// Used for logging and metrics.
 	GroupResource schema.GroupResource
+
+	// BackendFactory, when non-nil, is used to construct the raw storage
+	// for each resource instead of the upstream etcd3 path
+	// (generic.NewRawStorage). This is the seam KPEP-0001's storage backend
+	// registry plugs into: the apiserver resolves --storage-backend to a
+	// registry.Factory and installs it here. A nil value preserves the
+	// pre-registry behavior so callers that don't yet use the registry
+	// continue to hit etcd3 unchanged.
+	BackendFactory BackendFactory
 }
 
 // StorageWithClusterIdentity returns a generic.StorageDecorator that creates
@@ -88,7 +108,21 @@ func StorageWithClusterIdentity(cfg DecoratorConfig) generic.StorageDecorator {
 			return callerKeyFunc(obj)
 		}
 
-		s, d, err := generic.NewRawStorage(storageConfig, newFunc, newListFunc, resourcePrefix)
+		var s storage.Interface
+		var d factory.DestroyFunc
+		var err error
+		if cfg.BackendFactory != nil {
+			// Registered backend path (KPEP-0001). The Factory returns a
+			// storage.Interface + DestroyFunc with the same contract as
+			// upstream factory.Create. The cacher wraps it below exactly
+			// as it would wrap an etcd3-backed store.
+			s, d, err = cfg.BackendFactory(storageConfig, newFunc, newListFunc, resourcePrefix)
+		} else {
+			// Pre-registry default: upstream etcd3 path. Preserved so any
+			// caller that hasn't switched to setting BackendFactory keeps
+			// working unchanged.
+			s, d, err = generic.NewRawStorage(storageConfig, newFunc, newListFunc, resourcePrefix)
+		}
 		if err != nil {
 			return s, d, err
 		}
