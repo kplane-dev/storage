@@ -17,10 +17,6 @@ func (s *store) Watch(ctx context.Context, key string, opts storage.ListOptions)
 	return nil, errNotImplemented
 }
 
-func (s *store) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
-	return errNotImplemented
-}
-
 func (s *store) GuaranteedUpdate(
 	ctx context.Context, key string, destination runtime.Object,
 	ignoreNotFound bool, preconditions *storage.Preconditions,
