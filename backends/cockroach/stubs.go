@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
 )
@@ -15,14 +14,6 @@ var errNotImplemented = errors.New("cockroach: not implemented yet")
 
 func (s *store) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
 	return nil, errNotImplemented
-}
-
-func (s *store) GuaranteedUpdate(
-	ctx context.Context, key string, destination runtime.Object,
-	ignoreNotFound bool, preconditions *storage.Preconditions,
-	tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object,
-) error {
-	return errNotImplemented
 }
 
 func (s *store) Stats(ctx context.Context) (storage.Stats, error) {

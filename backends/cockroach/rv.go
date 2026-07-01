@@ -86,13 +86,17 @@ func decode(
 	if err != nil {
 		return storage.NewInternalError(err)
 	}
+	return decodePlain(codec, versioner, plain, obj, rv)
+}
+
+// decodePlain runs the codec decode + versioner UpdateObject steps for
+// callers that already hold the untransformed bytes.
+func decodePlain(codec runtime.Codec, versioner storage.Versioner, plain []byte, obj runtime.Object, rv uint64) error {
 	if _, _, err := codec.Decode(plain, nil, obj); err != nil {
 		return err
 	}
-	if rv != 0 {
-		if err := versioner.UpdateObject(obj, rv); err != nil {
-			return err
-		}
+	if rv == 0 {
+		return nil
 	}
-	return nil
+	return versioner.UpdateObject(obj, rv)
 }
