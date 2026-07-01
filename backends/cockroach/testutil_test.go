@@ -35,6 +35,25 @@ func skipIfNoCockroach(t *testing.T) {
 	_ = conn.Close(ctx)
 }
 
+// sqlExec matches the signature of pgx.Conn.Exec, restricted to the parts
+// helper functions need.
+type sqlExec func(ctx context.Context, sql string, args ...any) (any, error)
+
+// withAdmin dials the test DSN with a fresh pgx.Conn (no pool), passes an
+// Exec-compatible shim to fn, and closes the conn. Used by helpers that
+// create/drop databases without depending on any code under test.
+func withAdmin(ctx context.Context, fn func(context.Context, sqlExec) error) error {
+	conn, err := pgx.Connect(ctx, testDSN())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	return fn(ctx, func(ctx context.Context, sql string, args ...any) (any, error) {
+		tag, err := conn.Exec(ctx, sql, args...)
+		return tag, err
+	})
+}
+
 // setupTestPool returns a pgxpool.Pool connected to a fresh, uniquely-named
 // database. The database is dropped at teardown.
 func setupTestPool(t *testing.T) *pgxpool.Pool {
