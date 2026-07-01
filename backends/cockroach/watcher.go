@@ -163,7 +163,7 @@ func (w *watcher) sendInitialEventsList() error {
 			}
 		}
 	}
-	return nil
+	return w.emitInitialEventsEndBookmark()
 }
 
 func (w *watcher) sendInitialEventsSingle() error {
@@ -173,17 +173,49 @@ func (w *watcher) sendInitialEventsSingle() error {
 		return err
 	}
 	acc, aerr := meta.Accessor(obj)
-	if aerr != nil || acc.GetResourceVersion() == "" {
-		// IgnoreNotFound wrote a zero value — no row to replay.
+	if aerr == nil && acc.GetResourceVersion() != "" {
+		if err := w.deliver(watch.Event{Type: watch.Added, Object: obj}); err != nil {
+			return err
+		}
+		if rv, perr := w.store.versioner.ParseResourceVersion(acc.GetResourceVersion()); perr == nil && rv > w.startRV {
+			w.startRV = rv
+		}
+	}
+	return w.emitInitialEventsEndBookmark()
+}
+
+// emitInitialEventsEndBookmark completes the WatchList contract: when the
+// caller explicitly asked for SendInitialEvents AND allows bookmarks, we
+// must emit a Bookmark with the initial-events-end annotation so the
+// upstream reflector knows the replay is complete. Skipped for the
+// legacy RV=0 path where the caller doesn't opt into the WatchList
+// protocol.
+func (w *watcher) emitInitialEventsEndBookmark() error {
+	klog.V(4).Infof("cockroach watcher.emitBookmark: prefix=%q sendInit=%v allowBM=%v startRV=%d",
+		w.prefix, w.opts.SendInitialEvents, w.opts.Predicate.AllowWatchBookmarks, w.startRV)
+	if w.opts.SendInitialEvents == nil || !*w.opts.SendInitialEvents {
 		return nil
 	}
-	if err := w.deliver(watch.Event{Type: watch.Added, Object: obj}); err != nil {
+	if !w.opts.Predicate.AllowWatchBookmarks {
+		return nil
+	}
+	bookmark := w.store.newObject(nil)
+	rv := w.startRV
+	if rv == 0 {
+		cur, err := w.store.GetCurrentResourceVersion(w.ctx)
+		if err != nil {
+			return err
+		}
+		rv = cur
+	}
+	if err := w.store.versioner.UpdateObject(bookmark, rv); err != nil {
 		return err
 	}
-	if rv, perr := w.store.versioner.ParseResourceVersion(acc.GetResourceVersion()); perr == nil && rv > w.startRV {
-		w.startRV = rv
+	if err := storage.AnnotateInitialEventsEndBookmark(bookmark); err != nil {
+		return err
 	}
-	return nil
+	klog.V(4).Infof("cockroach watcher.emitBookmark: sending bookmark prefix=%q rv=%d", w.prefix, rv)
+	return w.deliver(watch.Event{Type: watch.Bookmark, Object: bookmark})
 }
 
 // dispatch translates a changefeed event into a watch.Event and applies
