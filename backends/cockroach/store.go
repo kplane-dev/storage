@@ -19,6 +19,11 @@ import (
 	"k8s.io/apiserver/pkg/storage/value"
 )
 
+// errChangefeedNotStarted is returned by Watch when SetChangefeed wasn't
+// called. Tests and constructors handle wiring; a Watch call arriving
+// before that is a programmer error, not a runtime condition.
+var errChangefeedNotStarted = errors.New("cockroach: changefeed subscription not started (call SetChangefeed)")
+
 // authenticatedDataString satisfies value.Context so the value transformer
 // can authenticate the encrypted payload against the storage key.
 type authenticatedDataString string
@@ -39,6 +44,11 @@ type store struct {
 	groupResource  string
 	newFunc        func() runtime.Object
 	newListFunc    func() runtime.Object
+
+	// changefeed backs Watch: a single subscription per store, fanned out
+	// to per-Watch subscribers by key prefix. May be nil if the store was
+	// constructed without SetChangefeed (Watch then returns InternalError).
+	changefeed *ChangefeedSubscription
 
 	// wrapDecodedObject wraps a decoded object with its storage key so
 	// the cacher's multicluster keyFunc can extract cluster identity.
@@ -75,6 +85,10 @@ func NewStore(
 		wrapDecodedObject: wrapDecodedObject,
 	}
 }
+
+// SetChangefeed installs the process-wide changefeed subscription. Must
+// be called before the first Watch. Passing nil leaves Watch broken.
+func (s *store) SetChangefeed(cf *ChangefeedSubscription) { s.changefeed = cf }
 
 // Versioner returns the resource-version scheme this store uses.
 func (s *store) Versioner() storage.Versioner { return s.versioner }
