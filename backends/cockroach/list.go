@@ -6,8 +6,6 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -53,30 +51,33 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 		return err
 	}
 
-	var rows pgx.Rows
-	if opts.Recursive {
-		startKey := preparedKey
-		if continueKey != "" {
-			startKey = continueKey
+	build := func(aostClause string) (string, []any) {
+		if opts.Recursive {
+			startKey := preparedKey
+			if continueKey != "" {
+				startKey = continueKey
+			}
+			endKey := prefixEnd(preparedKey)
+			q := `SELECT key, value, (crdb_internal_mvcc_timestamp)::STRING
+			      FROM kv ` + aostClause + `
+			      WHERE key >= $1 AND key < $2
+			        AND (expire_at IS NULL OR expire_at > now())
+			      ORDER BY key`
+			if opts.Predicate.Limit > 0 {
+				q += fmt.Sprintf(" LIMIT %d", opts.Predicate.Limit+1)
+			}
+			return q, []any{startKey, endKey}
 		}
-		endKey := prefixEnd(preparedKey)
-		q := `SELECT key, value, (crdb_internal_mvcc_timestamp)::STRING
-		      FROM kv ` + aost + `
-		      WHERE key >= $1 AND key < $2
-		        AND (expire_at IS NULL OR expire_at > now())
-		      ORDER BY key`
-		limitClause := ""
-		if opts.Predicate.Limit > 0 {
-			limitClause = fmt.Sprintf(" LIMIT %d", opts.Predicate.Limit+1)
-		}
-		q += limitClause
-		rows, err = s.pool.Query(ctx, q, startKey, endKey)
-	} else {
-		q := `SELECT key, value, (crdb_internal_mvcc_timestamp)::STRING
-		      FROM kv ` + aost + `
-		      WHERE key = $1
-		        AND (expire_at IS NULL OR expire_at > now())`
-		rows, err = s.pool.Query(ctx, q, preparedKey)
+		return `SELECT key, value, (crdb_internal_mvcc_timestamp)::STRING
+		        FROM kv ` + aostClause + `
+		        WHERE key = $1
+		          AND (expire_at IS NULL OR expire_at > now())`, []any{preparedKey}
+	}
+	q, args := build(aost)
+	rows, err := s.pool.Query(ctx, q, args...)
+	if isDatabaseTooYoung(err) && aost != "" {
+		q2, args2 := build("")
+		rows, err = s.pool.Query(ctx, q2, args2...)
 	}
 	if err != nil {
 		return err

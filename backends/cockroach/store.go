@@ -219,17 +219,32 @@ func (s *store) Get(ctx context.Context, key string, opts storage.GetOptions, ou
 	if err != nil {
 		return err
 	}
+	if opts.ResourceVersion != "" && opts.ResourceVersion != "0" {
+		if parsed, perr := s.versioner.ParseResourceVersion(opts.ResourceVersion); perr == nil && parsed > 0 {
+			if cur, cerr := s.GetCurrentResourceVersion(ctx); cerr == nil && parsed > cur {
+				return storage.NewTooLargeResourceVersionError(parsed, cur, 1)
+			}
+		}
+	}
 	aost, err := s.aostClause(ctx, opts.ResourceVersion)
 	if err != nil {
 		return err
 	}
-	q := `SELECT value, (crdb_internal_mvcc_timestamp)::STRING
-	      FROM kv ` + aost + `
-	      WHERE key = $1 AND (expire_at IS NULL OR expire_at > now())`
+	build := func(aostClause string) string {
+		return `SELECT value, (crdb_internal_mvcc_timestamp)::STRING
+		        FROM kv ` + aostClause + `
+		        WHERE key = $1 AND (expire_at IS NULL OR expire_at > now())`
+	}
 
 	var stored []byte
 	var mvcc string
-	err = s.pool.QueryRow(ctx, q, preparedKey).Scan(&stored, &mvcc)
+	err = s.pool.QueryRow(ctx, build(aost), preparedKey).Scan(&stored, &mvcc)
+	// A very young database can't serve AOST='-5s' — fall back to a strong
+	// read. Common only in test setups; production databases are old
+	// enough that follower reads always succeed.
+	if isDatabaseTooYoung(err) && aost != "" {
+		err = s.pool.QueryRow(ctx, build(""), preparedKey).Scan(&stored, &mvcc)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		if opts.IgnoreNotFound {
 			return runtime.SetZeroValue(out)
@@ -321,4 +336,13 @@ func (s *store) Delete(
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// isDatabaseTooYoung matches "database does not exist" (SQLSTATE 3D000)
+// which AS OF SYSTEM TIME returns when the requested past timestamp
+// predates the database's creation. Callers should fall back to a
+// strong read.
+func isDatabaseTooYoung(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "3D000"
 }
