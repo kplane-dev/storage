@@ -129,17 +129,24 @@ func (w *watcher) wantInitial() bool {
 	return w.opts.SendInitialEvents == nil && w.startRV == 0
 }
 
-// sendInitialEvents lists the current state and emits ADDED events for
-// each item. Advances startRV to the highest emitted item RV so the
-// streaming loop doesn't re-deliver the same rows via the changefeed's
-// initial-scan window.
+// sendInitialEvents replays the current state to the watcher as ADDED
+// events. Uses Get for single-key watches (prefix has no trailing slash)
+// and GetList for prefix watches — matching the caller's opts.Recursive.
+// Advances startRV to the highest emitted item's RV so the streaming
+// loop doesn't re-deliver those rows.
 func (w *watcher) sendInitialEvents() error {
+	if w.opts.Recursive {
+		return w.sendInitialEventsList()
+	}
+	return w.sendInitialEventsSingle()
+}
+
+func (w *watcher) sendInitialEventsList() error {
 	listObj := w.store.newListFunc()
-	err := w.store.GetList(w.ctx, w.prefix, storage.ListOptions{
+	if err := w.store.GetList(w.ctx, w.prefix, storage.ListOptions{
 		Predicate: w.opts.Predicate,
 		Recursive: true,
-	}, listObj)
-	if err != nil {
+	}, listObj); err != nil {
 		return err
 	}
 	items, err := extractListItems(listObj)
@@ -155,6 +162,26 @@ func (w *watcher) sendInitialEvents() error {
 				w.startRV = rv
 			}
 		}
+	}
+	return nil
+}
+
+func (w *watcher) sendInitialEventsSingle() error {
+	obj := w.store.newObject(nil)
+	err := w.store.Get(w.ctx, w.prefix, storage.GetOptions{IgnoreNotFound: true}, obj)
+	if err != nil {
+		return err
+	}
+	acc, aerr := meta.Accessor(obj)
+	if aerr != nil || acc.GetResourceVersion() == "" {
+		// IgnoreNotFound wrote a zero value — no row to replay.
+		return nil
+	}
+	if err := w.deliver(watch.Event{Type: watch.Added, Object: obj}); err != nil {
+		return err
+	}
+	if rv, perr := w.store.versioner.ParseResourceVersion(acc.GetResourceVersion()); perr == nil && rv > w.startRV {
+		w.startRV = rv
 	}
 	return nil
 }
@@ -190,7 +217,6 @@ func (w *watcher) dispatch(ev changefeedEvent) {
 		}
 		oldObj = obj
 	}
-
 	eventType, out := w.classify(ev, curObj, oldObj)
 	if out == nil {
 		return

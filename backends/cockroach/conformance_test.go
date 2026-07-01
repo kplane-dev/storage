@@ -3,6 +3,7 @@ package cockroach
 import (
 	"context"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/apitesting"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,6 +57,7 @@ func setupConformanceStore(t *testing.T) (context.Context, *store) {
 	cf.Start(context.Background())
 	raw.SetChangefeed(cf)
 	t.Cleanup(cf.Stop)
+	waitForChangefeedReady(t, cf, 5*time.Second)
 
 	scanner := NewTTLScanner(raw, 0)
 	scanner.Start(context.Background())
@@ -70,6 +72,21 @@ func setupConformanceStore(t *testing.T) (context.Context, *store) {
 func noopKeyValidation(ctx context.Context, t *testing.T, key string) {}
 
 func noopIncreaseRV(ctx context.Context, t *testing.T) int64 { return 0 }
+
+// waitForChangefeedReady blocks until the subscription has emitted at
+// least one resolved timestamp, meaning the underlying pgx conn is
+// established and the server-side changefeed job is streaming.
+func waitForChangefeedReady(t *testing.T, cf *ChangefeedSubscription, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cf.ResolvedHLC() != "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("changefeed never reached ready state within %v", d)
+}
 
 func TestConformance_Create(t *testing.T) {
 	ctx, s := setupConformanceStore(t)
