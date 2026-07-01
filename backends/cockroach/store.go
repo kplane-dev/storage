@@ -328,9 +328,6 @@ func (s *store) Delete(
 	return decode(s.codec, s.versioner, storedBytes, out, rv, s.transformer, preparedKey, ctx)
 }
 
-// Watch, GetList, GuaranteedUpdate, GetCurrentResourceVersion, and
-// RequestWatchProgress are implemented in dedicated files.
-
 // isUniqueViolation matches pgx-wrapped Cockroach unique_violation
 // (SQLSTATE 23505) which INSERT surfaces on primary-key collision.
 func isUniqueViolation(err error) bool {

@@ -191,8 +191,6 @@ func (w *watcher) sendInitialEventsSingle() error {
 // legacy RV=0 path where the caller doesn't opt into the WatchList
 // protocol.
 func (w *watcher) emitInitialEventsEndBookmark() error {
-	klog.V(4).Infof("cockroach watcher.emitBookmark: prefix=%q sendInit=%v allowBM=%v startRV=%d",
-		w.prefix, w.opts.SendInitialEvents, w.opts.Predicate.AllowWatchBookmarks, w.startRV)
 	if w.opts.SendInitialEvents == nil || !*w.opts.SendInitialEvents {
 		return nil
 	}
@@ -214,7 +212,6 @@ func (w *watcher) emitInitialEventsEndBookmark() error {
 	if err := storage.AnnotateInitialEventsEndBookmark(bookmark); err != nil {
 		return err
 	}
-	klog.V(4).Infof("cockroach watcher.emitBookmark: sending bookmark prefix=%q rv=%d", w.prefix, rv)
 	return w.deliver(watch.Event{Type: watch.Bookmark, Object: bookmark})
 }
 
