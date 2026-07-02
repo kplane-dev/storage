@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/storage"
@@ -121,6 +123,67 @@ func TestChangefeed_ResolvedAdvancesWatermark(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Errorf("no resolved HLC received within 5s")
+}
+
+func TestChangefeed_ReconnectResumesFromCursor(t *testing.T) {
+	s, cf := setupTestChangefeed(t)
+	sub := cf.Subscribe("/registry/testobjs/", 128)
+	t.Cleanup(func() { cf.Unsubscribe(sub) })
+	drainStale(sub, 200*time.Millisecond)
+
+	// Baseline event to prime a resolved timestamp we can resume from.
+	seedObjects(t, s, []string{"/testobjs/default/before-disconnect"})
+	waitForKey(t, sub, "/registry/testobjs/default/before-disconnect", 5*time.Second)
+
+	// Kill the server-side changefeed query; the reader loop should see
+	// the connection drop, back off, and reopen WITH cursor=<lastResolved>.
+	if err := killChangefeedQueries(context.Background(), s.pool); err != nil {
+		t.Fatalf("cancel changefeed: %v", err)
+	}
+
+	// Give the reader a beat to notice the drop and reopen. If reconnect
+	// is broken this loop times out on the next Create.
+	waitForReconnect(t, cf, sub, 10*time.Second)
+
+	// Post-reconnect write must arrive on the same subscriber.
+	seedObjects(t, s, []string{"/testobjs/default/after-reconnect"})
+	ev := waitForKey(t, sub, "/registry/testobjs/default/after-reconnect", 10*time.Second)
+	if !ev.isCreate {
+		t.Errorf("post-reconnect event isCreate=false; want true")
+	}
+}
+
+// killChangefeedQueries cancels every active CREATE CHANGEFEED on the
+// cluster, forcing an EOF on the reader's pgx conn. The filter anchors on
+// the query prefix so this CANCEL doesn't match itself.
+func killChangefeedQueries(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx,
+		`CANCEL QUERIES (SELECT query_id FROM [SHOW CLUSTER QUERIES] WHERE query ILIKE 'CREATE CHANGEFEED%')`,
+	)
+	return err
+}
+
+// waitForReconnect blocks until the subscription's ResolvedHLC advances
+// past the moment killChangefeedQueries fired. Proves the reader loop
+// re-established the changefeed and started receiving resolved rows.
+func waitForReconnect(t *testing.T, cf *ChangefeedSubscription, sub *changefeedSubscriber, d time.Duration) {
+	t.Helper()
+	before := cf.ResolvedHLC()
+	deadline := time.After(d)
+	for {
+		if cur := cf.ResolvedHLC(); cur != "" && cur > before {
+			return
+		}
+		select {
+		case _, ok := <-sub.events():
+			if !ok {
+				t.Fatalf("subscription closed before reconnect")
+			}
+		case <-time.After(200 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("reconnect did not advance resolved HLC within %v (before=%q, still=%q)", d, before, cf.ResolvedHLC())
+		}
+	}
 }
 
 func TestChangefeed_SubscriberFilterByPrefix(t *testing.T) {
