@@ -55,9 +55,21 @@ type ChangefeedSubscription struct {
 	done   chan struct{}
 }
 
+// defaultApplicationName tags the reader's SQL session so operators (and
+// tests) can identify it via SHOW SESSIONS / SHOW CLUSTER QUERIES.
+const defaultApplicationName = "kplane-cockroach-changefeed"
+
 // NewChangefeedSubscription constructs a subscription bound to connCfg. It
-// doesn't dial until Start is called.
+// doesn't dial until Start is called. If connCfg has no application_name
+// runtime param, we set a stable default so the changefeed session is
+// identifiable in cluster observability views.
 func NewChangefeedSubscription(connCfg *pgx.ConnConfig) *ChangefeedSubscription {
+	if connCfg.RuntimeParams == nil {
+		connCfg.RuntimeParams = make(map[string]string)
+	}
+	if _, ok := connCfg.RuntimeParams["application_name"]; !ok {
+		connCfg.RuntimeParams["application_name"] = defaultApplicationName
+	}
 	c := &ChangefeedSubscription{
 		connCfg:     connCfg,
 		subscribers: make(map[uint64]*changefeedSubscriber),
