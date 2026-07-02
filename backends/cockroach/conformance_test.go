@@ -59,7 +59,7 @@ func setupConformanceStore(t *testing.T) (context.Context, *store) {
 	t.Cleanup(cf.Stop)
 	waitForChangefeedReady(t, cf, 5*time.Second)
 
-	scanner := NewTTLScanner(raw, 0)
+	scanner := NewTTLScanner(raw.pool, 0)
 	scanner.Start(context.Background())
 	t.Cleanup(scanner.Stop)
 

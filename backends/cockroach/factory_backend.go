@@ -45,7 +45,7 @@ func NewFactoryBackend(ctx context.Context, cfg Config) (*FactoryBackend, error)
 	cf.Start(context.Background())
 
 	sr := &sharedRuntime{pool: pool, changefeed: cf}
-	sr.scanner = NewTTLScanner(&store{pool: pool}, 0)
+	sr.scanner = NewTTLScanner(pool, 0)
 	sr.scanner.Start(context.Background())
 
 	return &FactoryBackend{cfg: cfg, shared: sr}, nil

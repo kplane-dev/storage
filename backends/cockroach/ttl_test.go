@@ -28,7 +28,7 @@ func TestTTLScanner_DeletesExpiredRows(t *testing.T) {
 		}
 	}
 
-	scanner := NewTTLScanner(s, 100*time.Millisecond)
+	scanner := NewTTLScanner(s.pool, 100*time.Millisecond)
 	scanner.Start(ctx)
 	t.Cleanup(scanner.Stop)
 
@@ -74,7 +74,7 @@ func TestTTLScanner_EmitsChangefeedDeleteEvents(t *testing.T) {
 	t.Cleanup(w.Stop)
 	drainWatch(w, 200*time.Millisecond)
 
-	scanner := NewTTLScanner(s, 100*time.Millisecond)
+	scanner := NewTTLScanner(s.pool, 100*time.Millisecond)
 	scanner.Start(ctx)
 	t.Cleanup(scanner.Stop)
 
@@ -111,7 +111,7 @@ func TestTTLScanner_RefreshWinsRace(t *testing.T) {
 		t.Fatalf("refresh: %v", err)
 	}
 
-	scanner := NewTTLScanner(s, 50*time.Millisecond)
+	scanner := NewTTLScanner(s.pool, 50*time.Millisecond)
 	scanner.Start(ctx)
 	t.Cleanup(scanner.Stop)
 	time.Sleep(500 * time.Millisecond)
@@ -137,7 +137,7 @@ func TestTTLScanner_BatchLimit(t *testing.T) {
 		t.Fatalf("backdate: %v", err)
 	}
 
-	scanner := NewTTLScanner(s, 100*time.Millisecond)
+	scanner := NewTTLScanner(s.pool, 100*time.Millisecond)
 	scanner.batch = 50 // small batch to force multiple ticks
 	scanner.Start(ctx)
 	t.Cleanup(scanner.Stop)

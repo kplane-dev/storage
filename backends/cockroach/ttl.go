@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"k8s.io/klog/v2"
 )
 
@@ -24,8 +25,13 @@ const defaultTTLDeleteBatch = 100
 // synthetic events are produced here. Cockroach's built-in row-level TTL
 // job is left enabled as a backup for anything the scanner misses
 // (e.g. across a process crash), but the scanner is the fast path.
+//
+// The scanner holds the shared pgxpool directly rather than a per-store
+// handle: this decouples its lifecycle from any single store instance
+// and eliminates the shared-state mutation that would otherwise happen
+// on every FactoryBackend.Create.
 type TTLScanner struct {
-	store   *store
+	pool    *pgxpool.Pool
 	cadence time.Duration
 	batch   int
 
@@ -34,14 +40,15 @@ type TTLScanner struct {
 	once   sync.Once
 }
 
-// NewTTLScanner returns a scanner for the given store. Start begins the
-// loop; Stop cancels it. Cadence <=0 uses defaultTTLScanCadence.
-func NewTTLScanner(s *store, cadence time.Duration) *TTLScanner {
+// NewTTLScanner returns a scanner bound to the given connection pool.
+// Start begins the loop; Stop cancels it. Cadence <=0 uses
+// defaultTTLScanCadence.
+func NewTTLScanner(pool *pgxpool.Pool, cadence time.Duration) *TTLScanner {
 	if cadence <= 0 {
 		cadence = defaultTTLScanCadence
 	}
 	return &TTLScanner{
-		store:   s,
+		pool:    pool,
 		cadence: cadence,
 		batch:   defaultTTLDeleteBatch,
 		done:    make(chan struct{}),
@@ -84,7 +91,7 @@ func (t *TTLScanner) run(ctx context.Context) {
 // commits between our SELECT and DELETE, our DELETE's WHERE misses the
 // row and it survives. No CAS logic required client-side.
 func (t *TTLScanner) sweep(ctx context.Context) {
-	rows, err := t.store.pool.Query(ctx, `
+	rows, err := t.pool.Query(ctx, `
 		DELETE FROM kv
 		WHERE expire_at IS NOT NULL AND expire_at <= now()
 		LIMIT $1

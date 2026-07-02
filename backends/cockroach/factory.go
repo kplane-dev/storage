@@ -40,7 +40,7 @@ func NewBackendFactory(cfg Config) (kpstorage.BackendFactory, func(), error) {
 	cf.Start(context.Background())
 
 	shared := &sharedRuntime{pool: pool, changefeed: cf}
-	shared.scanner = NewTTLScanner(&store{pool: pool}, 0)
+	shared.scanner = NewTTLScanner(pool, 0)
 	shared.scanner.Start(context.Background())
 
 	build := kpstorage.BackendFactory(func(
@@ -83,12 +83,6 @@ func (r *sharedRuntime) newStore(
 		c.WrapDecodedObject,
 	)
 	s.SetChangefeed(r.changefeed)
-	// Point the TTL scanner at whichever store existed first — all share
-	// the same pool, so any store's context works. Idempotent (Start uses
-	// sync.Once inside the scanner).
-	if r.scanner != nil {
-		r.scanner.store = s
-	}
 	return s
 }
 
