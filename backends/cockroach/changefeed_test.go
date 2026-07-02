@@ -17,11 +17,26 @@ import (
 // setupTestChangefeed spins up a store plus a ChangefeedSubscription
 // wired to the same database. Cleanup stops the subscription.
 func setupTestChangefeed(t *testing.T) (*store, *ChangefeedSubscription) {
+	return setupTestChangefeedWithAppName(t, "")
+}
+
+// setupTestChangefeedWithAppName is setupTestChangefeed with an override
+// for the connection's application_name. Callers that need to isolate
+// their changefeed from parallel tests (e.g. CANCEL-based failure
+// injection) pass a unique name so filters can scope by application_name
+// instead of by query text.
+func setupTestChangefeedWithAppName(t *testing.T, appName string) (*store, *ChangefeedSubscription) {
 	t.Helper()
 	s := setupTestStore(t)
 	cc, err := (Config{DSN: testDSN(), Database: currentDatabase(t, s)}).ConnConfig()
 	if err != nil {
 		t.Fatalf("ConnConfig: %v", err)
+	}
+	if appName != "" {
+		if cc.RuntimeParams == nil {
+			cc.RuntimeParams = make(map[string]string)
+		}
+		cc.RuntimeParams["application_name"] = appName
 	}
 	cf := NewChangefeedSubscription(cc)
 	cf.Start(context.Background())
@@ -125,65 +140,93 @@ func TestChangefeed_ResolvedAdvancesWatermark(t *testing.T) {
 	t.Errorf("no resolved HLC received within 5s")
 }
 
+// TestChangefeed_ReconnectResumesFromCursor proves the cursor recovery
+// property: an event written while the reader is disconnected is still
+// delivered after reconnect, because readOnce reopens WITH
+// cursor=<lastResolved>, no_initial_scan. Session isolation is by
+// application_name so parallel tests don't kill each other's changefeeds.
 func TestChangefeed_ReconnectResumesFromCursor(t *testing.T) {
-	s, cf := setupTestChangefeed(t)
+	appName := fmt.Sprintf("kplane-test-reconnect-%d", time.Now().UnixNano())
+	s, cf := setupTestChangefeedWithAppName(t, appName)
 	sub := cf.Subscribe("/registry/testobjs/", 128)
 	t.Cleanup(func() { cf.Unsubscribe(sub) })
 	drainStale(sub, 200*time.Millisecond)
 
-	// Baseline event to prime a resolved timestamp we can resume from.
+	// Baseline: prime a resolved HLC we can resume from.
 	seedObjects(t, s, []string{"/testobjs/default/before-disconnect"})
 	waitForKey(t, sub, "/registry/testobjs/default/before-disconnect", 5*time.Second)
+	preCancelHLC := cf.ResolvedHLC()
+	if preCancelHLC == "" {
+		t.Fatal("no resolved HLC before cancel; cannot verify cursor resume")
+	}
 
-	// Kill the server-side changefeed query; the reader loop should see
-	// the connection drop, back off, and reopen WITH cursor=<lastResolved>.
-	if err := killChangefeedQueries(context.Background(), s.pool); err != nil {
+	// Kill only THIS subscription's changefeed, scoped by application_name.
+	if err := killChangefeedByAppName(context.Background(), s.pool, appName); err != nil {
 		t.Fatalf("cancel changefeed: %v", err)
 	}
+	// Wait until the server confirms the changefeed session is gone so
+	// the next write races the reader's reconnect backoff, not a live
+	// stream.
+	waitForNoChangefeed(t, s.pool, appName, 5*time.Second)
 
-	// Give the reader a beat to notice the drop and reopen. If reconnect
-	// is broken this loop times out on the next Create.
-	waitForReconnect(t, cf, sub, 10*time.Second)
+	// Write during the disconnect gap. The only way this event reaches
+	// the subscriber is if reconnect resumes from cursor=preCancelHLC.
+	seedObjects(t, s, []string{"/testobjs/default/during-outage"})
 
-	// Post-reconnect write must arrive on the same subscriber.
-	seedObjects(t, s, []string{"/testobjs/default/after-reconnect"})
-	ev := waitForKey(t, sub, "/registry/testobjs/default/after-reconnect", 10*time.Second)
+	ev := waitForKey(t, sub, "/registry/testobjs/default/during-outage", 15*time.Second)
 	if !ev.isCreate {
-		t.Errorf("post-reconnect event isCreate=false; want true")
+		t.Errorf("recovered event isCreate=false; want true")
 	}
+	// Resolved-timestamp rows tick at ~1s; the create can beat them out
+	// of the reconnected stream. Give the next bookmark a beat before
+	// asserting HLC forward progress.
+	waitForResolvedAdvance(t, cf, preCancelHLC, 15*time.Second)
 }
 
-// killChangefeedQueries cancels every active CREATE CHANGEFEED on the
-// cluster, forcing an EOF on the reader's pgx conn. The filter anchors on
-// the query prefix so this CANCEL doesn't match itself.
-func killChangefeedQueries(ctx context.Context, pool *pgxpool.Pool) error {
+// waitForResolvedAdvance polls until the subscription's ResolvedHLC
+// moves past baseline, proving the reader is streaming bookmarks (not
+// just a one-off recovered row).
+func waitForResolvedAdvance(t *testing.T, cf *ChangefeedSubscription, baseline string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cur := cf.ResolvedHLC(); cur > baseline {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Errorf("resolved HLC did not advance past %q within %v", baseline, d)
+}
+
+// killChangefeedByAppName cancels active CREATE CHANGEFEED queries whose
+// session has the given application_name. Scoping by app name keeps this
+// from disturbing changefeeds owned by parallel tests.
+func killChangefeedByAppName(ctx context.Context, pool *pgxpool.Pool, appName string) error {
 	_, err := pool.Exec(ctx,
-		`CANCEL QUERIES (SELECT query_id FROM [SHOW CLUSTER QUERIES] WHERE query ILIKE 'CREATE CHANGEFEED%')`,
+		`CANCEL QUERIES (SELECT query_id FROM [SHOW CLUSTER QUERIES] WHERE application_name = $1 AND query ILIKE 'CREATE CHANGEFEED%')`,
+		appName,
 	)
 	return err
 }
 
-// waitForReconnect blocks until the subscription's ResolvedHLC advances
-// past the moment killChangefeedQueries fired. Proves the reader loop
-// re-established the changefeed and started receiving resolved rows.
-func waitForReconnect(t *testing.T, cf *ChangefeedSubscription, sub *changefeedSubscriber, d time.Duration) {
+// waitForNoChangefeed polls SHOW CLUSTER QUERIES until no CREATE
+// CHANGEFEED for the given application_name is active. Confirms the
+// CANCEL propagated and the reader is now in its reconnect backoff.
+func waitForNoChangefeed(t *testing.T, pool *pgxpool.Pool, appName string, d time.Duration) {
 	t.Helper()
-	before := cf.ResolvedHLC()
-	deadline := time.After(d)
-	for {
-		if cur := cf.ResolvedHLC(); cur != "" && cur > before {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		var n int
+		err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM [SHOW CLUSTER QUERIES] WHERE application_name = $1 AND query ILIKE 'CREATE CHANGEFEED%'`,
+			appName,
+		).Scan(&n)
+		if err == nil && n == 0 {
 			return
 		}
-		select {
-		case _, ok := <-sub.events():
-			if !ok {
-				t.Fatalf("subscription closed before reconnect")
-			}
-		case <-time.After(200 * time.Millisecond):
-		case <-deadline:
-			t.Fatalf("reconnect did not advance resolved HLC within %v (before=%q, still=%q)", d, before, cf.ResolvedHLC())
-		}
+		time.Sleep(100 * time.Millisecond)
 	}
+	t.Fatalf("changefeed for app_name=%q still active after %v", appName, d)
 }
 
 func TestChangefeed_SubscriberFilterByPrefix(t *testing.T) {
