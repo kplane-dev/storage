@@ -113,11 +113,33 @@ func (w *watcher) run() {
 				return
 			}
 			if ev.isProgress {
+				w.emitProgressBookmark(ev.mvccHLC)
 				continue
 			}
 			w.dispatch(ev)
 		}
 	}
+}
+
+// emitProgressBookmark forwards a changefeed resolved-timestamp row as a
+// watch.Bookmark. The cacher's watchCache advances its resourceVersion
+// on any received event (including bookmarks); without this, waitlist
+// requests that call GetCurrentResourceVersion (which returns the live
+// Cockroach HLC) will block forever waiting for watchCache to catch up
+// to an HLC that no real write will ever produce.
+func (w *watcher) emitProgressBookmark(hlc string) {
+	if !w.opts.Predicate.AllowWatchBookmarks {
+		return
+	}
+	rv, err := hlcToRV(hlc)
+	if err != nil || rv <= w.startRV {
+		return
+	}
+	obj := w.store.newObject(nil)
+	if err := w.store.versioner.UpdateObject(obj, rv); err != nil {
+		return
+	}
+	_ = w.deliver(watch.Event{Type: watch.Bookmark, Object: obj})
 }
 
 // wantInitial mirrors etcd3's areInitialEventsRequired: RV=0 with

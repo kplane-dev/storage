@@ -30,11 +30,22 @@ func (s *store) ReadinessCheck() error {
 	return s.pool.Ping(context.Background())
 }
 
-// RequestWatchProgress is a best-effort no-op. Cockroach changefeeds emit
-// resolved-timestamp rows on their own cadence; we don't force an early
-// one. Consumers relying on progress notifications will see them from
-// the natural stream instead.
-func (s *store) RequestWatchProgress(ctx context.Context) error { return nil }
+// RequestWatchProgress forces a progress notification to all active
+// watchers using the current cluster_logical_timestamp. Called by the
+// cacher's ConditionalProgressRequester when a client blocks waiting
+// for the watchCache to reach a fresh RV. Without this, waitlist
+// requests hang for 3 seconds and time out with TooLargeResourceVersion.
+func (s *store) RequestWatchProgress(ctx context.Context) error {
+	if s.changefeed == nil {
+		return nil
+	}
+	rv, err := s.GetCurrentResourceVersion(ctx)
+	if err != nil {
+		return err
+	}
+	s.changefeed.PublishProgress(rvToHLC(rv))
+	return nil
+}
 
 // EnableResourceSizeEstimation is a no-op — we don't estimate sizes yet.
 // Same shape as the Spanner backend; used by admission for RSS accounting.

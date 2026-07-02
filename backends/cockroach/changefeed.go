@@ -126,6 +126,20 @@ func (c *ChangefeedSubscription) ResolvedHLC() string {
 	return ""
 }
 
+// PublishProgress synthesizes an out-of-band progress event and fans it
+// out to every subscriber. Called by store.RequestWatchProgress when the
+// cacher needs the watchCache advanced sooner than the changefeed's
+// natural resolved-timestamp cadence would deliver.
+func (c *ChangefeedSubscription) PublishProgress(hlc string) {
+	if hlc == "" {
+		return
+	}
+	if cur, _ := c.resolvedHLC.Load().(string); cur < hlc {
+		c.resolvedHLC.Store(hlc)
+	}
+	c.dispatch(changefeedEvent{isProgress: true, mvccHLC: hlc})
+}
+
 func (c *ChangefeedSubscription) run(ctx context.Context) {
 	defer close(c.done)
 	backoff := 500 * time.Millisecond
