@@ -32,13 +32,7 @@ func setupTestChangefeedWithAppName(t *testing.T, appName string) (*store, *Chan
 	if err != nil {
 		t.Fatalf("ConnConfig: %v", err)
 	}
-	if appName != "" {
-		if cc.RuntimeParams == nil {
-			cc.RuntimeParams = make(map[string]string)
-		}
-		cc.RuntimeParams["application_name"] = appName
-	}
-	cf := NewChangefeedSubscription(cc)
+	cf := NewChangefeedSubscription(cc).WithApplicationName(appName)
 	cf.Start(context.Background())
 	t.Cleanup(cf.Stop)
 	// Give the subscription a beat to open its query before writes start.

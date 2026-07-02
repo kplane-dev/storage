@@ -44,7 +44,8 @@ type changefeedSubscriber struct {
 // table and fans events out to registered subscribers. Reconnects on
 // disconnect using WITH cursor=<lastResolved> so no events are lost.
 type ChangefeedSubscription struct {
-	connCfg *pgx.ConnConfig
+	connCfg         *pgx.ConnConfig
+	applicationName string
 
 	mu          sync.RWMutex
 	subscribers map[uint64]*changefeedSubscriber
@@ -60,22 +61,26 @@ type ChangefeedSubscription struct {
 const defaultApplicationName = "kplane-cockroach-changefeed"
 
 // NewChangefeedSubscription constructs a subscription bound to connCfg. It
-// doesn't dial until Start is called. If connCfg has no application_name
-// runtime param, we set a stable default so the changefeed session is
-// identifiable in cluster observability views.
+// doesn't dial until Start is called. Callers may pre-set
+// applicationName via WithApplicationName to override the default tag.
 func NewChangefeedSubscription(connCfg *pgx.ConnConfig) *ChangefeedSubscription {
-	if connCfg.RuntimeParams == nil {
-		connCfg.RuntimeParams = make(map[string]string)
-	}
-	if _, ok := connCfg.RuntimeParams["application_name"]; !ok {
-		connCfg.RuntimeParams["application_name"] = defaultApplicationName
-	}
 	c := &ChangefeedSubscription{
-		connCfg:     connCfg,
-		subscribers: make(map[uint64]*changefeedSubscriber),
-		done:        make(chan struct{}),
+		connCfg:         connCfg,
+		applicationName: defaultApplicationName,
+		subscribers:     make(map[uint64]*changefeedSubscriber),
+		done:            make(chan struct{}),
 	}
 	c.resolvedHLC.Store("")
+	return c
+}
+
+// WithApplicationName overrides the tag applied to the reader's SQL
+// session via SET application_name after each connect. Must be called
+// before Start.
+func (c *ChangefeedSubscription) WithApplicationName(name string) *ChangefeedSubscription {
+	if name != "" {
+		c.applicationName = name
+	}
 	return c
 }
 
@@ -187,6 +192,15 @@ func (c *ChangefeedSubscription) readOnce(ctx context.Context) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer func() { _ = conn.Close(context.Background()) }()
+
+	// Tag the session so operators and failure-injection tests can find
+	// this reader via SHOW SESSIONS / SHOW CLUSTER QUERIES. SET does not
+	// support bound parameters through the extended protocol, so we inline
+	// the value with single-quote escaping.
+	setStmt := fmt.Sprintf("SET application_name = '%s'", strings.ReplaceAll(c.applicationName, "'", "''"))
+	if _, err := conn.Exec(ctx, setStmt); err != nil {
+		return fmt.Errorf("set application_name: %w", err)
+	}
 
 	stmt := c.buildChangefeedSQL()
 	rows, err := conn.Query(ctx, stmt)
