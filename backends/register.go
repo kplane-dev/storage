@@ -9,6 +9,7 @@
 package backends
 
 import (
+	"github.com/kplane-dev/storage/backends/postgres"
 	"github.com/kplane-dev/storage/backends/spanner"
 	"github.com/kplane-dev/storage/registry"
 )
@@ -20,7 +21,7 @@ import (
 // apiserver main, after RegisterBuiltin.
 func RegisterBuiltin(b *registry.Backends) {
 	b.Register(spanner.NewOptions())
+	b.Register(postgres.NewOptions())
 	// Future backends:
-	//   b.Register(postgres.NewOptions())
 	//   b.Register(kine.NewOptions())
 }
